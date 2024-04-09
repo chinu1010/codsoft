@@ -1,0 +1,121 @@
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, LSTM, Embedding
+
+# Load pre-trained VGG16 model for feature extraction
+def load_vgg_model():
+    base_model = VGG16(include_top=False, weights='imagenet')
+    model = Model(inputs=base_model.input, outputs=base_model.get_layer('block5_conv3').output)
+    return model
+
+# Load and preprocess the image
+def preprocess_image(image_path):
+    img = tf.keras.preprocessing.image.load_img(image_path, target_size=(224, 224))  # Resize image to (224, 224)
+    img = tf.keras.preprocessing.image.img_to_array(img)
+    img = tf.keras.applications.vgg16.preprocess_input(img)
+    return img
+
+# Extract image features using VGG16 model
+def extract_image_features(image_path, model):
+    img = preprocess_image(image_path)
+    img = np.expand_dims(img, axis=0)
+    features = model.predict(img)
+    return features
+
+# Load captions and preprocess text
+def load_captions(captions_file):
+    with open(captions_file, 'r') as f:
+        captions = f.read().strip().split('\n')
+    caption_dict = {}
+    for caption in captions:
+        parts = caption.split('\t')
+        img_filename, caption_text = parts[0], '\t'.join(parts[1:])
+        img_id = int(img_filename.split('image')[1].split('.')[0])
+        caption_text = '<start> ' + caption_text.lower() + ' <end>'  # add start and end tokens
+        if img_id not in caption_dict:
+            caption_dict[img_id] = []
+        caption_dict[img_id].append(caption_text)
+    return caption_dict
+
+
+# Tokenize captions and create word index mapping
+def tokenize_captions(captions_dict):
+    tokenizer = tf.keras.preprocessing.text.Tokenizer()
+    tokenizer.fit_on_texts(captions_dict.values())
+    return tokenizer
+
+# Generate sequences from tokenized captions
+def generate_sequences(tokenizer, captions_dict, image_features, max_length, vocab_size):
+    X1, X2, y = [], [], []
+    for img_id, captions in captions_dict.items():
+        for caption in captions:
+            seq = tokenizer.texts_to_sequences([caption])[0]
+            for i in range(1, len(seq)):
+                in_seq, out_seq = seq[:i], seq[i]
+                in_seq = pad_sequences([in_seq], maxlen=max_length)[0]
+                out_seq = to_categorical([out_seq], num_classes=vocab_size)[0]
+                X1.append(image_features[img_id])  # Removed [0] indexing
+                X2.append(in_seq)
+                y.append(out_seq)
+    return np.array(X1), np.array(X2), np.array(y)
+
+# Define image captioning model
+def define_model(max_length, vocab_size, input_shape):
+    inputs1 = Input(shape=input_shape)  # Update input shape to match VGG16 output shape
+    fe1 = layers.Flatten()(inputs1)
+    fe2 = layers.Dense(256, activation='relu')(fe1)
+
+    inputs2 = Input(shape=(max_length,))
+    se1 = Embedding(vocab_size, 256, mask_zero=True)(inputs2)
+    se2 = layers.LSTM(256)(se1)
+
+    decoder1 = layers.add([fe2, se2])
+    decoder2 = layers.Dense(256, activation='relu')(decoder1)
+    outputs = layers.Dense(vocab_size, activation='softmax')(decoder2)
+
+    model = Model(inputs=[inputs1, inputs2], outputs=outputs)
+    model.compile(loss='categorical_crossentropy', optimizer='adam')
+    model.summary()
+    return model
+
+# Define paths and constants
+image_path = 'images/'
+captions_file = 'captions.txt'
+max_length = 50
+
+# Count the number of images in the directory
+num_images = len(os.listdir(image_path))
+
+# Load VGG16 model
+vgg_model = load_vgg_model()
+
+# Extract image features
+image_features = {}
+for img_id in range(1, num_images+1):
+    image_file = image_path + 'image' + str(img_id) + '.jpg'
+    image_features[img_id] = extract_image_features(image_file, vgg_model)
+
+# Load and preprocess captions
+captions_dict = load_captions(captions_file)
+
+# Tokenize captions and create word index mapping
+tokenizer = tokenize_captions(captions_dict)
+vocab_size = len(tokenizer.word_index) + 1
+
+# Generate sequences from tokenized captions
+X1train, X2train, ytrain = generate_sequences(tokenizer, captions_dict, image_features, max_length, vocab_size)
+
+# Define the image captioning model
+model = define_model(max_length, vocab_size, input_shape=(14, 14, 512))
+
+# Train the model
+model.fit([X1train, X2train], ytrain, epochs=20, batch_size=64)
+
+# Save the model
+model.save('image_captioning_model.h5')
